@@ -123,6 +123,10 @@ class VWWebSession(OpenIDSession):
                     raise AuthenticationError(f'It seems like you need to accept the terms and conditions. '
                                               f'Try to visit the URL "{url}" or log into smartphone app.')
 
+            # Check if URL starts with redirect URI before making HTTP request
+            if url.startswith(self.redirect_uri):
+                break
+                
             response = self.websession.get(url, allow_redirects=False)
             if response.status_code == requests.codes['internal_server_error']:
                 raise RetrievalError('Temporary server error during login')
