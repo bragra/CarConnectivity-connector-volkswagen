@@ -127,6 +127,10 @@ class VWWebSession(OpenIDSession):
             if url.startswith(self.redirect_uri):
                 break
                 
+            # Check if URL is using the custom weconnect scheme before making HTTP request
+            if url.startswith('weconnect://'):
+                break
+                
             response = self.websession.get(url, allow_redirects=False)
             if response.status_code == requests.codes['internal_server_error']:
                 raise RetrievalError('Temporary server error during login')
