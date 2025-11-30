@@ -217,6 +217,29 @@ class WeConnectSession(VWWebSession):
         self.token = parsed_token
         return parsed_token
 
+    def _persist_tokens(self, new_token, old_refresh_token=None):
+        """
+        Persist tokens between sessions, ensuring we maintain refresh tokens.
+        
+        Args:
+            new_token (dict): New token data
+            old_refresh_token (str): Previous refresh token to preserve if needed
+            
+        Returns:
+            dict: The final token data to store
+        """
+        if not new_token:
+            return None
+            
+        # Always preserve the refresh token if we have one
+        if 'refresh_token' not in new_token and old_refresh_token:
+            LOG.debug('Preserving previous refresh token')
+            new_token['refresh_token'] = old_refresh_token
+            
+        # Store the token in the session
+        self.token = new_token
+        return new_token
+
     def refresh_tokens(
         self,
         token_url,
@@ -248,25 +271,26 @@ class WeConnectSession(VWWebSession):
         Returns:
             dict: The new tokens.
         """
-        LOG.info('Refreshing tokens')
+        LOG.info('Attempting to refresh tokens')
         if not token_url:
             raise ValueError("No token endpoint set for auto_refresh.")
 
         if not is_secure_transport(token_url):
             raise InsecureTransportError()
 
-        # Store old refresh token in case no new one is given
-        # First try to get from the current token property, then fall back to stored token
+        # Validate and retrieve refresh token
         if refresh_token is None:
             refresh_token = self.refresh_token
-            # If still None, try to get from the token dict directly
             if refresh_token is None and self.token is not None:
                 refresh_token = self.token.get('refresh_token')
         
         if not refresh_token:
+            LOG.error('No refresh token available for refresh attempt')
             raise AuthenticationError('No refresh token available. Please log in again.')
 
-        # Create headers matching the examples format
+        LOG.debug('Using refresh token (last 4 chars): %s', refresh_token[-4:] if refresh_token else 'None')
+
+        # Prepare request headers and body
         tHeaders = {
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
@@ -275,37 +299,49 @@ class WeConnectSession(VWWebSession):
             "x-android-package-name": "com.volkswagen.weconnect",
         }
 
-        # Create form data body matching the examples format
         body = {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "client_id": self.client_id,
         }
 
-        # Request new tokens using POST with form data
-        token_response = self.post(
-            token_url,
-            data=body,
-            headers=tHeaders,
-            timeout=timeout,
-            verify=verify,
-            proxies=proxies,
-        )
-        
-        if token_response.status_code == requests.codes['unauthorized']:
-            LOG.error('Token refresh failed with 401 - server requests new authorization. Refresh token may be expired or invalid.')
-            raise AuthenticationError('Refreshing tokens failed: Server requests new authorization. Please log in again.')
-        elif token_response.status_code in (requests.codes['internal_server_error'], requests.codes['service_unavailable'], requests.codes['gateway_timeout']):
-            raise TemporaryAuthenticationError(f'Token could not be refreshed due to temporary WeConnect failure: {token_response.status_code}')
-        elif token_response.status_code == requests.codes['ok']:
-            # parse new tokens from response
-            new_token = self.parse_from_body(token_response.text)
-            if new_token is not None and "refresh_token" not in new_token:
-                LOG.debug("No new refresh token given. Re-using old.")
-                new_token["refresh_token"] = refresh_token
-                # Update the token property as well
+        try:
+            # Request new tokens using POST with form data
+            token_response = self.post(
+                token_url,
+                data=body,
+                headers=tHeaders,
+                timeout=timeout,
+                verify=verify,
+                proxies=proxies,
+            )
+            
+            if token_response.status_code == requests.codes['unauthorized']:
+                LOG.error('Token refresh failed with 401 - refresh token invalid or expired')
+                raise AuthenticationError('Refreshing tokens failed: Server requests new authorization. Please log in again.')
+            elif token_response.status_code in (requests.codes['internal_server_error'],
+                                             requests.codes['service_unavailable'],
+                                             requests.codes['gateway_timeout']):
+                LOG.warning('Temporary server error during token refresh (status: %d)', token_response.status_code)
+                raise TemporaryAuthenticationError(f'Token could not be refreshed due to temporary WeConnect failure: {token_response.status_code}')
+            elif token_response.status_code == requests.codes['ok']:
+                # parse new tokens from response
+                new_token = self.parse_from_body(token_response.text)
+                if new_token is None:
+                    LOG.error('Failed to parse token response')
+                    raise RetrievalError('Invalid token response format')
+                
+                if "refresh_token" not in new_token:
+                    LOG.debug('No new refresh token provided - preserving existing one')
+                    new_token["refresh_token"] = refresh_token
+                
+                LOG.info('Token refresh successful. New access token expires in %d seconds',
+                        new_token.get('expires_in', 0))
                 self.token = new_token
-            LOG.debug("Successfully refreshed tokens")
-            return new_token
-        else:
-            raise RetrievalError(f'Status Code from WeConnect while refreshing tokens was: {token_response.status_code}')
+                return new_token
+            else:
+                LOG.error('Unexpected status code during token refresh: %d', token_response.status_code)
+                raise RetrievalError(f'Unexpected status code from WeConnect: {token_response.status_code}')
+        except requests.exceptions.RequestException as req_err:
+            LOG.error('Request failed during token refresh: %s', str(req_err))
+            raise TemporaryAuthenticationError(f'Network error during token refresh: {str(req_err)}')

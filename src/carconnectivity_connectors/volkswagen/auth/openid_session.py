@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from typing import Dict
 
 LOG = logging.getLogger("carconnectivity.connectors.volkswagen.auth")
+LOG.addHandler(logging.NullHandler())  # Prevent "No handlers found" warnings
 
 
 class AccessType(Enum):
@@ -47,6 +48,32 @@ class OpenIDSession(requests.Session):
     """
     OpenIDSession is a subclass of requests.Session that handles OpenID Connect authentication.
     """
+    
+    def validate_token(self, token_type=AccessType.ACCESS):
+        """
+        Validate the current token's state before attempting refresh.
+        
+        Args:
+            token_type (AccessType): Type of token to validate (ACCESS, ID, REFRESH)
+            
+        Returns:
+            bool: True if token is valid for refresh attempt
+        """
+        if token_type == AccessType.ACCESS:
+            if not self.access_token:
+                LOG.debug('No access token available for validation')
+                return False
+        elif token_type == AccessType.ID:
+            if not self.id_token:
+                LOG.debug('No ID token available for validation')
+                return False
+        elif token_type == AccessType.REFRESH:
+            if not self.refresh_token:
+                LOG.debug('No refresh token available for validation')
+                return False
+                
+        # Additional validation could be added here (expiry checks, format validation, etc)
+        return True
     def __init__(self, client_id=None, redirect_uri=None, refresh_url=None, scope=None, token=None, metadata=None, state=None, timeout=None,
                  force_relogin_after=None, **kwargs) -> None:
         super(OpenIDSession, self).__init__(**kwargs)
@@ -144,8 +171,10 @@ class OpenIDSession(requests.Session):
             None
         """
         if new_token is not None:
+            LOG.debug('Setting new token with keys: %s', list(new_token.keys()))
             # If new token e.g. after refresh is missing expires_in we assume it is the same than before
             if 'expires_in' not in new_token:
+                LOG.debug('Token missing expires_in, calculating from existing or default')
                 if self._token is not None and 'expires_in' in self._token:
                     new_token['expires_in'] = self._token['expires_in']
                 else:
@@ -301,11 +330,12 @@ class OpenIDSession(requests.Session):
 
     def refresh(self):
         """
-        Refresh the current session, needs to be implemetned in subclass
+        Refresh the current session, needs to be implemented in subclass
 
         This method is intended to refresh the authentication session.
         Currently, it is not implemented and does not perform any actions.
         """
+        LOG.debug('Base refresh() called - should be implemented in subclass')
 
     def authorization_url(self, url, state=None, **kwargs):
         """
@@ -370,35 +400,43 @@ class OpenIDSession(requests.Session):
                 url, headers, data = self.add_token(url, body=data, headers=headers, access_type=access_type, token=token)
             # Attempt to retrieve and save new access token if expired
             except TokenExpiredError:
-                LOG.info('Token expired')
+                LOG.info('Token expired - attempting refresh')
                 self.access_token = None
                 try:
+                    LOG.debug('Attempting token refresh with refresh_token: %s', 'available' if self.refresh_token else 'not available')
                     self.refresh()
+                    LOG.debug('Token refresh successful')
                 except AuthenticationError as auth_error:
-                    # Check if this is a "Server requests new authorization" error
-                    if 'Server requests new authorization' in str(auth_error):
+                    error_msg = str(auth_error)
+                    if 'Server requests new authorization' in error_msg:
                         LOG.warning('Server requests new authorization - clearing tokens and forcing re-login')
-                        # Clear all tokens to force fresh login
                         if hasattr(self, 'clear_tokens'):
                             self.clear_tokens()
                         else:
-                            # Fallback for base class
                             self.token = None
                             self.access_token = None
                             self.refresh_token = None
                             self.id_token = None
-                    LOG.info('Authentication failed during refresh - attempting new login')
-                    self.login()
+                        LOG.debug('Tokens cleared, attempting new login')
+                        self.login()
+                    else:
+                        LOG.error('Authentication failed during refresh: %s', error_msg)
+                        raise
                 except TokenExpiredError:
+                    LOG.error('Refresh token expired - forcing new login')
                     self.login()
                 except MissingTokenError:
+                    LOG.error('Missing required token for refresh - forcing new login')
                     self.login()
-                except RetrievalError:
-                    LOG.error('Retrieval Error while refreshing token. Probably the token was invalidated. Trying to do a new login instead.')
-                    self.login()
+                except RetrievalError as retrieval_error:
+                    LOG.error('Retrieval Error while refreshing token: %s', str(retrieval_error))
+                    raise
+                except Exception as unexpected_error:
+                    LOG.error('Unexpected error during token refresh: %s', str(unexpected_error))
+                    raise
                 url, headers, data = self.add_token(url, body=data, headers=headers, access_type=access_type, token=token)
             except MissingTokenError:
-                LOG.info('Missing token, need new login')
+                LOG.error('Missing required token - forcing new login')
                 self.login()
                 url, headers, data = self.add_token(url, body=data, headers=headers, access_type=access_type, token=token)
 
