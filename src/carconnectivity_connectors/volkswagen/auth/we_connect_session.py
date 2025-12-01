@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 import json
 import logging
 import secrets
+import keyring
+import threading
 
 from urllib.parse import parse_qsl, urlparse
 
@@ -27,20 +29,31 @@ if TYPE_CHECKING:
 
 
 LOG: logging.Logger = logging.getLogger("carconnectivity.connectors.volkswagen.auth")
-
+LOG.setLevel(logging.DEBUG)  # Enable detailed logging for debugging
 
 class WeConnectSession(VWWebSession):
     """
     WeConnectSession class handles the authentication and session management for Volkswagen's WeConnect service.
     """
     def __init__(self, session_user, **kwargs) -> None:
-        super(WeConnectSession, self).__init__(client_id='a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com',
-                                               refresh_url='https://identity.vwgroup.io/oidc/v1/token',
-                                               scope='openid profile badge cars dealers vin',
-                                               redirect_uri='weconnect://authenticated',
-                                               state=None,
-                                               session_user=session_user,
-                                               **kwargs)
+        """Initialize WeConnectSession while maintaining backward compatibility"""
+        LOG.info("Initializing WeConnectSession for user: %s", session_user)
+        # Maintain original parameter defaults for backward compatibility
+        kwargs.setdefault('client_id', 'a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com')
+        kwargs.setdefault('refresh_url', 'https://identity.vwgroup.io/oidc/v1/token')
+        kwargs.setdefault('scope', 'openid profile badge cars dealers vin')
+        kwargs.setdefault('redirect_uri', 'weconnect://authenticated')
+        kwargs.setdefault('state', None)
+        
+        super(WeConnectSession, self).__init__(session_user=session_user, **kwargs)
+        LOG.debug("Session initialized with client_id: %s", self.client_id)
+        self._token_lock = threading.Lock()
+        self._monitor_active = False
+        self._monitor_thread = None
+        self._load_tokens()
+
+        # Start token monitoring thread
+        self._start_token_monitor()
 
         self.headers = CaseInsensitiveDict({
             'accept': '*/*',
@@ -73,26 +86,134 @@ class WeConnectSession(VWWebSession):
         we_connect_trace_id = (traceId[:8] + '-' + traceId[8:12] + '-' + traceId[12:16] + '-' + traceId[16:20] + '-' + traceId[20:]).upper()
         headers = headers or {}
         headers['weconnect-trace-id'] = we_connect_trace_id
-
-        return super(WeConnectSession, self).request(
-            method, url, headers=headers, data=data, withhold_token=withhold_token, access_type=access_type, token=token, timeout=timeout, **kwargs
-        )
+        LOG.debug("Adding weconnect-trace-id header: %s", we_connect_trace_id)
+        
+        with self._token_lock:
+            return super(WeConnectSession, self).request(
+                method, url, headers=headers, data=data, withhold_token=withhold_token,
+                access_type=access_type, token=token, timeout=timeout, **kwargs
+            )
 
     def login(self):
+        """Authenticate with WeConnect service with comprehensive error handling"""
         super(WeConnectSession, self).login()
-        # retrieve authorization URL
-        authorization_url_str: str = self.authorization_url(url='https://identity.vwgroup.io/oidc/v1/authorize')
-        # perform web authentication
-        response = self.do_web_auth(authorization_url_str)
-        # fetch tokens from web authentication response
-        self.fetch_tokens('https://emea.bff.cariad.digital/user-login/login/v1',
-                          authorization_response=response)
+        max_attempts = 3
+        last_error = None
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # retrieve authorization URL
+                authorization_url_str: str = self.authorization_url(url='https://identity.vwgroup.io/oidc/v1/authorize')
+                # perform web authentication
+                response = self.do_web_auth(authorization_url_str)
+                # fetch tokens from web authentication response
+                self.fetch_tokens('https://emea.bff.cariad.digital/user-login/login/v1',
+                                authorization_response=response)
+                return  # Success
+            except TemporaryAuthenticationError as e:
+                last_error = e
+                LOG.warning(f"Login attempt {attempt} failed (temporary error), retrying...")
+                time.sleep(2 ** attempt)  # Exponential backoff
+            except AuthenticationError as e:
+                last_error = e
+                LOG.error(f"Login attempt {attempt} failed (authentication error)")
+                break
+            except requests.exceptions.RequestException as e:
+                last_error = TemporaryAuthenticationError(f"Network error during login: {str(e)}")
+                LOG.warning(f"Login attempt {attempt} failed (network error), retrying...")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                last_error = AuthenticationError(f"Unexpected error during login: {str(e)}")
+                LOG.error(f"Login attempt {attempt} failed (unexpected error)")
+                break
+        
+        # If we get here, all attempts failed
+        LOG.error("All login attempts failed")
+        if last_error:
+            raise last_error
+        raise AuthenticationError("Login failed after multiple attempts")
 
     def refresh(self) -> None:
-        # refresh tokens from refresh endpoint
-        self.refresh_tokens(
-            'https://emea.bff.cariad.digital/login/v1/idk/token',
+        """Refresh authentication tokens with comprehensive error handling"""
+        max_attempts = 2
+        last_error = None
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # First try normal refresh
+                self.refresh_tokens(
+                    'https://emea.bff.cariad.digital/login/v1/idk/token',
+                )
+                return  # Success
+            except TemporaryAuthenticationError as e:
+                last_error = e
+                LOG.warning(f"Refresh attempt {attempt} failed (temporary error), retrying...")
+                time.sleep(2 ** attempt)  # Exponential backoff
+            except AuthenticationError as e:
+                last_error = e
+                LOG.error("Refresh token invalid, attempting full login...")
+                try:
+                    self.clear_tokens()
+                    self.login()
+                    return  # Success via full login
+                except Exception as e:
+                    last_error = e
+                    break
+            except requests.exceptions.RequestException as e:
+                last_error = TemporaryAuthenticationError(f"Network error during refresh: {str(e)}")
+                LOG.warning(f"Refresh attempt {attempt} failed (network error), retrying...")
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                last_error = AuthenticationError(f"Unexpected error during refresh: {str(e)}")
+                LOG.error(f"Refresh attempt {attempt} failed (unexpected error)")
+                break
+        
+        # If we get here, all attempts failed
+        LOG.error("All refresh attempts failed")
+        if last_error:
+            raise last_error
+        raise AuthenticationError("Refresh failed after multiple attempts")
+
+    def _start_token_monitor(self) -> None:
+        """Start background thread to monitor token expiration"""
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            return
+            
+        self._monitor_active = True
+        self._monitor_thread = threading.Thread(
+            target=self._monitor_tokens,
+            daemon=True,
+            name="TokenMonitor"
         )
+        self._monitor_thread.start()
+        LOG.debug("Started token monitoring thread")
+        
+    def _monitor_tokens(self) -> None:
+        """Background thread to check token expiration and refresh when needed"""
+        while self._monitor_active:
+            try:
+                with self._token_lock:
+                    if not self.token:
+                        time.sleep(10)
+                        continue
+                        
+                    expires_in = int(self.token.get('expires_in', 0))
+                    
+                # Refresh if token will expire in next 2 minutes
+                if 0 < expires_in < 120:
+                    LOG.info("Proactively refreshing expiring token")
+                    try:
+                        self.refresh()
+                    except Exception as e:
+                        LOG.error(f"Proactive token refresh failed: {str(e)}")
+                        
+                # Sleep for half the remaining time or 30s minimum
+                sleep_time = max(30, expires_in // 2) if expires_in > 0 else 30
+                time.sleep(sleep_time)
+                
+            except Exception as e:
+                LOG.error(f"Token monitor error: {str(e)}")
+                time.sleep(30)
 
     def clear_tokens(self) -> None:
         """
@@ -102,8 +223,24 @@ class WeConnectSession(VWWebSession):
         and we need to clear invalid/expired tokens.
         """
         LOG.info("Clearing all stored tokens")
-        self.token = None
-        LOG.debug("All tokens cleared successfully")
+        self._monitor_active = False
+        if self._monitor_thread:
+            self._monitor_thread.join(timeout=5)
+            
+        with self._token_lock:
+            self.token = None
+            try:
+                keyring.delete_password('carconnectivity_volkswagen',
+                                      f'{self.session_user}_access_token')
+                keyring.delete_password('carconnectivity_volkswagen',
+                                      f'{self.session_user}_refresh_token')
+                keyring.delete_password('carconnectivity_volkswagen',
+                                      f'{self.session_user}_id_token')
+                keyring.delete_password('carconnectivity_volkswagen',
+                                      f'{self.session_user}_expires_at')
+                LOG.debug("All tokens cleared successfully from memory and secure storage")
+            except Exception as e:
+                LOG.error(f"Failed to clear tokens from keyring: {str(e)}")
 
     def authorization_url(self, url, state=None, **kwargs) -> str:
         if state is not None:
@@ -236,9 +373,116 @@ class WeConnectSession(VWWebSession):
             LOG.debug('Preserving previous refresh token')
             new_token['refresh_token'] = old_refresh_token
             
-        # Store the token in the session
-        self.token = new_token
+        # Store the token in the session and keyring
+        with self._token_lock:
+            self.token = new_token
+            try:
+                if new_token.get('access_token'):
+                    keyring.set_password('carconnectivity_volkswagen',
+                                       f'{self.session_user}_access_token',
+                                       new_token['access_token'])
+                if new_token.get('refresh_token'):
+                    keyring.set_password('carconnectivity_volkswagen',
+                                       f'{self.session_user}_refresh_token',
+                                       new_token['refresh_token'])
+                if new_token.get('id_token'):
+                    keyring.set_password('carconnectivity_volkswagen',
+                                       f'{self.session_user}_id_token',
+                                       new_token['id_token'])
+                if new_token.get('expires_in'):
+                    keyring.set_password('carconnectivity_volkswagen',
+                                       f'{self.session_user}_expires_at',
+                                       str(int(time.time()) + int(new_token['expires_in'])))
+            except Exception as e:
+                LOG.error(f"Failed to store tokens in keyring: {str(e)}")
+                
         return new_token
+        
+    def _load_tokens(self):
+        """Load tokens from secure storage if available"""
+        with self._token_lock:
+            try:
+                access_token = keyring.get_password('carconnectivity_volkswagen',
+                                                  f'{self.session_user}_access_token')
+                refresh_token = keyring.get_password('carconnectivity_volkswagen',
+                                                  f'{self.session_user}_refresh_token')
+                id_token = keyring.get_password('carconnectivity_volkswagen',
+                                             f'{self.session_user}_id_token')
+                expires_at = keyring.get_password('carconnectivity_volkswagen',
+                                               f'{self.session_user}_expires_at')
+                
+                if access_token and refresh_token and id_token:
+                    self.token = {
+                        'access_token': access_token,
+                        'refresh_token': refresh_token,
+                        'id_token': id_token,
+                        'expires_in': max(0, int(expires_at) - int(time.time())) if expires_at else 0
+                    }
+                    LOG.debug("Successfully loaded tokens from secure storage")
+            except Exception as e:
+                LOG.error(f"Failed to load tokens from keyring: {str(e)}")
+                self.token = None
+                
+    def _validate_token(self, token: dict) -> bool:
+            """
+            Validate token structure and expiration
+            
+            Args:
+                token: Token dictionary to validate
+                
+            Returns:
+                bool: True if token is valid, False otherwise
+            """
+            try:
+                if not token:
+                    LOG.debug("Token validation failed: empty token")
+                    return False
+                    
+                required_keys = {'access_token', 'refresh_token', 'id_token'}
+                if not required_keys.issubset(token.keys()):
+                    LOG.debug("Token validation failed: missing required fields")
+                    return False
+                    
+                if not all(isinstance(token[k], str) and token[k] for k in required_keys):
+                    LOG.debug("Token validation failed: invalid token values")
+                    return False
+                    
+                # Check expiration if available
+                if 'expires_in' in token and int(token.get('expires_in', 0)) <= 0:
+                    LOG.debug("Token validation failed: token expired")
+                    return False
+                    
+                return True
+            except Exception as e:
+                LOG.error(f"Token validation error: {str(e)}")
+                return False
+            
+    def _should_refresh_token(self) -> bool:
+            """
+            Determine if token should be refreshed based on expiration and validity
+            
+            Returns:
+                bool: True if token should be refreshed, False otherwise
+            """
+            try:
+                if not self.token:
+                    LOG.debug("Token refresh needed: no token available")
+                    return True
+                    
+                if not self._validate_token(self.token):
+                    LOG.debug("Token refresh needed: invalid token")
+                    return True
+                    
+                # Refresh if token is about to expire (within 5 minutes)
+                expires_in = int(self.token.get('expires_in', 0))
+                if expires_in > 0 and expires_in < 300:
+                    LOG.debug(f"Token refresh needed: expires in {expires_in} seconds")
+                    return True
+                    
+                return False
+            except Exception as e:
+                LOG.error(f"Token refresh check error: {str(e)}")
+                return True
 
     def refresh_tokens(
         self,
@@ -271,7 +515,15 @@ class WeConnectSession(VWWebSession):
         Returns:
             dict: The new tokens.
         """
-        LOG.info('Attempting to refresh tokens')
+        with self._token_lock:
+            if not self._should_refresh_token():
+                LOG.debug('Token refresh not needed - using existing valid token')
+                return self.token
+                
+            # Store current refresh token for rotation
+            old_refresh_token = self.token.get('refresh_token') if self.token else None
+            
+        LOG.info('Attempting to refresh tokens with proactive rotation')
         if not token_url:
             raise ValueError("No token endpoint set for auto_refresh.")
 
@@ -334,10 +586,28 @@ class WeConnectSession(VWWebSession):
                 if "refresh_token" not in new_token:
                     LOG.debug('No new refresh token provided - preserving existing one')
                     new_token["refresh_token"] = refresh_token
+                else:
+                    # If we got a new refresh token, invalidate the old one
+                    if old_refresh_token and old_refresh_token != new_token["refresh_token"]:
+                        try:
+                            # Attempt to revoke old refresh token
+                            revoke_body = {
+                                "token": old_refresh_token,
+                                "token_type_hint": "refresh_token",
+                                "client_id": self.client_id
+                            }
+                            self.post('https://identity.vwgroup.io/oidc/v1/revoke',
+                                     data=revoke_body,
+                                     headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                                     access_type=AccessType.NONE)
+                            LOG.debug("Successfully revoked old refresh token")
+                        except Exception as e:
+                            LOG.warning(f"Failed to revoke old refresh token: {str(e)}")
                 
                 LOG.info('Token refresh successful. New access token expires in %d seconds',
                         new_token.get('expires_in', 0))
-                self.token = new_token
+                with self._token_lock:
+                    self.token = new_token
                 return new_token
             else:
                 LOG.error('Unexpected status code during token refresh: %d', token_response.status_code)
