@@ -49,7 +49,7 @@ class VWWebSession(OpenIDSession):
         # and stale connections cause "Remote end closed connection without response" errors
         self.websession.mount('https://', HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20))
         self.websession.headers = CaseInsensitiveDict({
-            'user-agent': 'Volkswagen/3.51.1-android/14',
+            'user-agent': 'Volkswagen/3.61.0-android/14',
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,'
                       'application/signed-exchange;v=b3',
             'accept-language': 'en-US,en;q=0.9',
@@ -111,7 +111,7 @@ class VWWebSession(OpenIDSession):
         # Check if we already have the final OAuth callback URL
         if url.startswith('weconnect://authenticated'):
             LOG.info("Already have OAuth callback URL with tokens, returning immediately")
-            return url.replace('weconnect://authenticated#', 'https://egal?')
+            return url.replace('weconnect://authenticated', 'https://egal')
         
         # Get the login form
         email_form: HTMLFormParser = self._get_login_form(url)
@@ -208,15 +208,20 @@ class VWWebSession(OpenIDSession):
         LOG.debug(f"DEBUG [do_web_auth]: Exited while loop, final URL before transformation: {url[:150]}")
         
         # Handle the transformation based on the URL pattern
-        if url.startswith('weconnect://authenticated#'):
-            # Transform weconnect://authenticated# to https://egal?
-            transformed_url = url.replace('weconnect://authenticated#', 'https://egal?')
-            LOG.debug(f"DEBUG [do_web_auth]: Transformed weconnect://authenticated# URL to: {transformed_url[:150]}")
+        # With response_type=code, params come in the query string (not fragment)
+        # But some providers still use fragment; handle both
+        if url.startswith('weconnect://authenticated'):
+            transformed_url = url.replace('weconnect://authenticated', 'https://egal')
+            LOG.debug(f"DEBUG [do_web_auth]: Transformed weconnect://authenticated URL to: {transformed_url[:150]}")
             return transformed_url
-        elif self.redirect_uri and url.startswith(self.redirect_uri + '#'):
-            # Transform redirect_uri# to https://egal?
-            transformed_url = url.replace(self.redirect_uri + '#', 'https://egal?')
-            LOG.debug(f"DEBUG [do_web_auth]: Transformed redirect_uri# URL to: {transformed_url[:150]}")
+        elif self.redirect_uri and url.startswith(self.redirect_uri):
+            # Handle redirect_uri with either ? or # params
+            prefix = self.redirect_uri + '#'
+            if url.startswith(prefix):
+                transformed_url = url.replace(prefix, 'https://egal?')
+            else:
+                transformed_url = url.replace(self.redirect_uri, 'https://egal')
+            LOG.debug(f"DEBUG [do_web_auth]: Transformed redirect_uri URL to: {transformed_url[:150]}")
             return transformed_url
         else:
             LOG.warning(f"DEBUG [do_web_auth]: URL doesn't match expected patterns, returning as-is: {url[:150]}")
@@ -230,7 +235,7 @@ class VWWebSession(OpenIDSession):
             return None
         
         # Also check if URL contains tokens already (might be a callback URL)
-        if '#access_token=' in url or '#code=' in url:
+        if '#access_token=' in url or '#code=' in url or '?code=' in url:
             LOG.info(f"[_get_login_form] URL already contains OAuth tokens, skipping legacy auth flow")
             LOG.debug(f"DEBUG [_get_login_form]: URL contains tokens, returning None: {url[:150]}")
             return None
