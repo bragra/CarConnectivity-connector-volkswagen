@@ -2,11 +2,15 @@
 Module implements the WeConnect Session handling.
 """
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import json
 import logging
 import secrets
+import hmac
+import hashlib
+import time
+from pathlib import Path
 
 from urllib.parse import parse_qs, urlparse
 
@@ -28,6 +32,169 @@ if TYPE_CHECKING:
 
 
 LOG: logging.Logger = logging.getLogger("carconnectivity.connectors.volkswagen.auth")
+
+
+_CARIAD_TOKEN_URL = "https://emea.bff.cariad.digital/auth/v1/idk/oidc/token"
+
+_QM_CLIENT_ID = "01da27b0"
+_QM_SECRET = "1ab69925ac179aaa4e83abe671a9476d176418b85bd706f1436ca15be647989c"
+
+
+_ALTERNATE_CLIENT_IDS: dict[str, tuple[str, ...]] = {
+    "audi": (
+        "16dd7960-431d-4b88-b3a5-35724b2fce01@apps_vw-dilab_com",
+    ),
+    "volkswagen": (
+        "4edc53db-4b79-4e37-b614-19a95dea20dc@apps_vw-dilab_com",
+        "a24fba63-34b3-4d43-b181-942111e6bda8@apps_vw-dilab_com",
+    ),
+}
+
+
+def _resolve_cache_root() -> Path | None:
+    here = Path(__file__).resolve()
+    for parent in (here.parent, *here.parents):
+        candidate = parent / ".app-atlas-apk-cache"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+_APK_CACHE_ROOT: Path | None = _resolve_cache_root()
+
+
+def _load_apk_auth_secrets(brand_name: str) -> dict[str, Any]:
+    if _APK_CACHE_ROOT is None:
+        return {}
+    json_path = _APK_CACHE_ROOT / f"{brand_name}.json"
+    if not json_path.is_file():
+        return {}
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    versions = data.get("versions") or {}
+    if not versions:
+        return {}
+    latest_v = max(versions.keys())
+    findings = (versions[latest_v].get("findings") or {})
+    return findings.get("auth_secrets") or {}
+
+
+class AuthConfigResolver:
+    def __init__(
+        self,
+        brand_name: str,
+        *,
+        hardcoded_client_id: str,
+        hardcoded_qmauth_secret: str,
+        hardcoded_qmauth_client_id: str,
+        hardcoded_token_url: str,
+    ) -> None:
+        self._brand = brand_name
+        self._apk = _load_apk_auth_secrets(brand_name)
+        self._hardcoded_client_id = hardcoded_client_id
+        self._hardcoded_qmauth_secret = hardcoded_qmauth_secret
+        self._hardcoded_qmauth_client_id = hardcoded_qmauth_client_id
+        self._hardcoded_token_url = hardcoded_token_url
+        if self._apk:
+            LOG.debug(
+                "AuthConfigResolver(%s): loaded auth_secrets from APK cache: keys=%s",
+                brand_name, list(self._apk.keys()),
+            )
+
+    def qmauth_secret(self) -> str:
+        candidates = self._apk.get("qmauth_secret_candidates") or []
+        for c in candidates:
+            if isinstance(c, str) and len(c) == 64:
+                return c.lower()
+        return self._hardcoded_qmauth_secret
+
+    def qmauth_client_id(self) -> str:
+        candidates = self._apk.get("client_id_candidates") or []
+        for c in candidates:
+            if isinstance(c, str) and len(c) == 8 and all(
+                ch in "0123456789abcdef" for ch in c.lower()
+            ):
+                return c.lower()
+        return self._hardcoded_qmauth_client_id
+
+    def token_url(self) -> str:
+        paths = self._apk.get("token_path_markers_seen") or []
+        for p in paths:
+            if p == "/auth/v1/idk/oidc/token":
+                return "https://emea.bff.cariad.digital/auth/v1/idk/oidc/token"
+        return self._hardcoded_token_url
+
+    def oauth_client_id_chain(self) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        def _add(cid: str) -> None:
+            if cid and cid not in seen:
+                ordered.append(cid)
+                seen.add(cid)
+
+        for c in (self._apk.get("client_id_candidates") or []):
+            if isinstance(c, str) and "@apps_vw-dilab_com" in c:
+                _add(c)
+
+        for alt in _ALTERNATE_CLIENT_IDS.get(self._brand, ()):
+            _add(alt)
+
+        _add(self._hardcoded_client_id)
+        return ordered
+
+    def provenance(self) -> dict[str, str]:
+        return {
+            "qmauth_secret": (
+                "apk" if self._apk.get("qmauth_secret_candidates")
+                else "hardcoded"
+            ),
+            "qmauth_client_id": (
+                "apk" if self._apk.get("client_id_candidates")
+                else "hardcoded"
+            ),
+            "token_url": (
+                "apk" if any(
+                    p == "/auth/v1/idk/oidc/token"
+                    for p in (self._apk.get("token_path_markers_seen") or [])
+                )
+                else "hardcoded"
+            ),
+            "oauth_client_id_chain_size": str(len(self.oauth_client_id_chain())),
+        }
+
+
+def _calculate_x_qmauth(
+    secret_hex: str | None = None,
+    client_id: str | None = None,
+    now: float | None = None,
+) -> str:
+    secret_hex = secret_hex or _QM_SECRET
+    client_id = client_id or _QM_CLIENT_ID
+    ts = int((now if now is not None else time.time()) / 100)
+    secret_bytes = bytes.fromhex(secret_hex)
+    sig = hmac.new(secret_bytes, str(ts).encode("ascii"), hashlib.sha256).hexdigest()
+    return f"v1:{client_id}:{sig}"
+
+
+def _cariad_token_headers(
+    user_agent: str,
+    *,
+    qmauth_secret: str | None = None,
+    qmauth_client_id: str | None = None,
+) -> dict[str, str]:
+    return {
+        "Content-Type":           "application/x-www-form-urlencoded",
+        "Accept":                 "application/json",
+        "Accept-Charset":         "utf-8",
+        "User-Agent":             user_agent,
+        "x-qmauth":               _calculate_x_qmauth(qmauth_secret, qmauth_client_id),
+        "x-platform":             "android",
+        "x-android-package-name": "com.volkswagen.weconnect",
+        "x-assertion":            "0",
+    }
 
 
 class WeConnectSession(VWWebSession):
@@ -121,28 +288,12 @@ class WeConnectSession(VWWebSession):
                                           state=self.state, nonce=generate_nonce())
         return auth_url
 
-    def fetch_tokens(
+    def fetch_tokens(  # noqa: C901
         self,
         token_url,
         authorization_response=None,
         **_
     ):
-        """
-        Fetches tokens by exchanging the authorization code at the OIDC token endpoint.
-
-        Args:
-            token_url (str): The OIDC token endpoint URL.
-            authorization_response (str, optional): The authorization callback URL containing the code. Defaults to None.
-            **_ : Additional keyword arguments.
-
-        Returns:
-            dict: A dictionary containing the fetched tokens if successful.
-            None: If the tokens could not be fetched.
-
-        Raises:
-            TemporaryAuthenticationError: If the token request fails due to a temporary WeConnect failure.
-        """
-        # Parse authorization code from the callback URL (query params with response_type=code)
         if authorization_response:
             parsed = urlparse(authorization_response)
             params = parse_qs(parsed.query)
@@ -154,35 +305,82 @@ class WeConnectSession(VWWebSession):
             LOG.error("No authorization response provided")
             return None
 
-        body = {
-            'grant_type': 'authorization_code',
-            'code': auth_code,
-            'redirect_uri': self.redirect_uri,
-            'client_id': self.client_id,
-        }
+        resolver = AuthConfigResolver(
+            "volkswagen",
+            hardcoded_client_id=self.client_id,
+            hardcoded_qmauth_secret=_QM_SECRET,
+            hardcoded_qmauth_client_id=_QM_CLIENT_ID,
+            hardcoded_token_url=_CARIAD_TOKEN_URL,
+        )
+        client_id_chain = resolver.oauth_client_id_chain()
 
-        request_headers: CaseInsensitiveDict = CaseInsensitiveDict({
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': 'application/json',
-            'User-Agent': 'Volkswagen/3.61.0-android/14',
-            'x-android-package-name': 'com.volkswagen.weconnect',
-        })
+        last_error: AuthenticationError | None = None
+        for idx, client_id in enumerate(client_id_chain):
+            body = {
+                'grant_type': 'authorization_code',
+                'code': auth_code,
+                'redirect_uri': self.redirect_uri,
+                'client_id': client_id,
+            }
 
-        token_response = self.post(token_url, headers=request_headers, data=body, allow_redirects=False,
-                                   access_type=AccessType.NONE, withhold_token=True)
-        if token_response.status_code != requests.codes['ok']:
-            raise TemporaryAuthenticationError(f'Token could not be fetched due to temporary WeConnect failure: {token_response.status_code}')
-        token = self.parse_from_body(token_response.text)
+            request_headers: CaseInsensitiveDict = CaseInsensitiveDict(
+                _cariad_token_headers(
+                    'Volkswagen/3.61.0-android/14',
+                    qmauth_secret=resolver.qmauth_secret(),
+                    qmauth_client_id=resolver.qmauth_client_id(),
+                )
+            )
 
-        if token is not None:
-            LOG.debug(f"Successfully fetched tokens. Access token expires in: {token.get('expires_in', 'unknown')} seconds")
-            LOG.debug(f"Refresh token available: {'refresh_token' in token}")
-            if not all(key in token for key in ('access_token', 'id_token', 'refresh_token')):
-                LOG.warning("Some expected tokens are missing from the response")
-        else:
-            LOG.error("Token parsing returned None")
+            token_response = self.post(token_url, headers=request_headers, data=body, allow_redirects=False,
+                                       access_type=AccessType.NONE, withhold_token=True)
+            if token_response.status_code == requests.codes['ok']:
+                if idx > 0:
+                    LOG.info(
+                        "Token exchange (volkswagen): fallback client_id #%d "
+                        "succeeded — primary candidates 4xx'd",
+                        idx,
+                    )
+                token = self.parse_from_body(token_response.text)
 
-        return token
+                if token is not None:
+                    LOG.debug(f"Successfully fetched tokens. Access token expires in: {token.get('expires_in', 'unknown')} seconds")
+                    LOG.debug(f"Refresh token available: {'refresh_token' in token}")
+                    if not all(key in token for key in ('access_token', 'id_token', 'refresh_token')):
+                        LOG.warning("Some expected tokens are missing from the response")
+                else:
+                    LOG.error("Token parsing returned None")
+
+                return token
+
+            # 4xx on non-last candidate: retry with next client_id
+            if 400 <= token_response.status_code < 500 and idx < len(client_id_chain) - 1:
+                LOG.debug(
+                    "Token exchange (volkswagen) client_id %s..%s rejected "
+                    "(HTTP %d) — trying next candidate",
+                    client_id[:8], client_id[-4:],
+                    token_response.status_code,
+                )
+                last_error = AuthenticationError(
+                    f"Token exchange failed HTTP {token_response.status_code}: "
+                    f"{token_response.text[:200]}"
+                )
+                continue
+
+            # 4xx on last candidate: specific auth error
+            if 400 <= token_response.status_code < 500:
+                raise AuthenticationError(
+                    f"Token exchange failed HTTP {token_response.status_code}: "
+                    f"{token_response.text[:200]}"
+                )
+
+            # 5xx or other: temporary failure
+            raise TemporaryAuthenticationError(
+                f'Token could not be fetched due to temporary WeConnect failure: {token_response.status_code}'
+            )
+
+        raise last_error or AuthenticationError(
+            "Token exchange: all client_id candidates exhausted"
+        )
 
     def parse_from_body(self, token_response, state=None):
         """
@@ -271,21 +469,26 @@ class WeConnectSession(VWWebSession):
             # If clearing fails, log but continue - not critical
             LOG.debug("Could not clear connection pool: %s", str(e))
 
-        # Create headers matching the examples format
-        tHeaders = {
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Volkswagen/3.61.0-android/14",
-            "x-android-package-name": "com.volkswagen.weconnect",
-        }
+        resolver = AuthConfigResolver(
+            "volkswagen",
+            hardcoded_client_id=self.client_id,
+            hardcoded_qmauth_secret=_QM_SECRET,
+            hardcoded_qmauth_client_id=_QM_CLIENT_ID,
+            hardcoded_token_url=_CARIAD_TOKEN_URL,
+        )
 
-        # Create form data body matching the examples format
-        body = {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": self.client_id,
-        }
+        # Create headers matching the examples format
+        tHeaders = CaseInsensitiveDict(
+            _cariad_token_headers(
+                'Volkswagen/3.61.0-android/14',
+                qmauth_secret=resolver.qmauth_secret(),
+                qmauth_client_id=resolver.qmauth_client_id(),
+            )
+        )
+        # Connection and Accept-Encoding are set by default by requests; ensure Keep-Alive
+        tHeaders['Connection'] = 'keep-alive'
+
+        client_id_chain = resolver.oauth_client_id_chain()
 
         # Use a shorter timeout for token refresh to prevent stale connection issues
         # Token endpoints should respond quickly; 30 seconds is more than enough
@@ -294,33 +497,64 @@ class WeConnectSession(VWWebSession):
         if timeout is None:
             timeout = 30
 
-        # Request new tokens using POST with form data
-        # CRITICAL: withhold_token=True prevents adding Bearer token to token refresh request
-        # Token refresh uses refresh_token in the body, NOT Bearer token in headers
-        token_response = self.post(
-            token_url,
-            data=body,
-            headers=tHeaders,
-            timeout=timeout,
-            verify=verify,
-            withhold_token=True,
-            proxies=proxies,
-        )
-        
-        if token_response.status_code == requests.codes['unauthorized']:
-            LOG.error('Token refresh failed with 401 - server requests new authorization. Refresh token may be expired or invalid.')
-            raise AuthenticationError('Refreshing tokens failed: Server requests new authorization. Please log in again.')
-        elif token_response.status_code in (requests.codes['internal_server_error'], requests.codes['service_unavailable'], requests.codes['gateway_timeout']):
-            raise TemporaryAuthenticationError(f'Token could not be refreshed due to temporary WeConnect failure: {token_response.status_code}')
-        elif token_response.status_code == requests.codes['ok']:
-            # parse new tokens from response (this internally sets self.token)
-            new_token = self.parse_from_body(token_response.text)
-            if new_token is not None and "refresh_token" not in new_token:
-                LOG.debug("No new refresh token given. Re-using old.")
-                new_token["refresh_token"] = refresh_token
-                # Update the token property to include the refresh_token
-                self.token = new_token
-            LOG.debug("Successfully refreshed tokens")
-            return new_token
-        else:
+        last_error: AuthenticationError | None = None
+        for idx, client_id in enumerate(client_id_chain):
+            body = {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+            }
+
+            token_response = self.post(
+                token_url,
+                data=body,
+                headers=tHeaders,
+                timeout=timeout,
+                verify=verify,
+                withhold_token=True,
+                proxies=proxies,
+            )
+
+            if token_response.status_code == requests.codes['ok']:
+                if idx > 0:
+                    LOG.info(
+                        "Token refresh (volkswagen): fallback client_id #%d "
+                        "succeeded — primary candidates 4xx'd",
+                        idx,
+                    )
+                new_token = self.parse_from_body(token_response.text)
+                if new_token is not None and "refresh_token" not in new_token:
+                    LOG.debug("No new refresh token given. Re-using old.")
+                    new_token["refresh_token"] = refresh_token
+                    self.token = new_token
+                LOG.debug("Successfully refreshed tokens")
+                return new_token
+
+            # 4xx on non-last candidate: retry with next client_id
+            if 400 <= token_response.status_code < 500 and idx < len(client_id_chain) - 1:
+                LOG.debug(
+                    "Token refresh (volkswagen) client_id %s..%s rejected "
+                    "(HTTP %d) — trying next candidate",
+                    client_id[:8], client_id[-4:],
+                    token_response.status_code,
+                )
+                last_error = AuthenticationError(
+                    'Refreshing tokens failed: Server requests new authorization. Please log in again.'
+                )
+                continue
+
+            # 4xx on last candidate (or non-retriable): raise immediately
+            if token_response.status_code == requests.codes['unauthorized']:
+                LOG.error('Token refresh failed with 401 - server requests new authorization. Refresh token may be expired or invalid.')
+                raise AuthenticationError('Refreshing tokens failed: Server requests new authorization. Please log in again.')
+            if 400 <= token_response.status_code < 500:
+                LOG.error('Token refresh failed with %d - server requests new authorization.', token_response.status_code)
+                raise AuthenticationError('Refreshing tokens failed: Server requests new authorization. Please log in again.')
+            if token_response.status_code in (requests.codes['internal_server_error'], requests.codes['service_unavailable'], requests.codes['gateway_timeout']):
+                raise TemporaryAuthenticationError(f'Token could not be refreshed due to temporary WeConnect failure: {token_response.status_code}')
+
             raise RetrievalError(f'Status Code from WeConnect while refreshing tokens was: {token_response.status_code}')
+
+        raise last_error or AuthenticationError(
+            "Token refresh: all client_id candidates exhausted"
+        )
